@@ -27,8 +27,7 @@ func readVarUint(r io.Reader, n uint) (uint64, error) {
 		}
 		b := uint64(p[0])
 		switch {
-		// note: can not use b < 1<<n, when n == 64, 1<<n will overflow to 0
-		case b < 1<<7 && b <= 1<<n-1:
+		case b < 1<<7 && b < 1<<n:
 			res += (1 << shift) * b
 			return res, nil
 		case b >= 1<<7 && n > 7:
@@ -98,10 +97,4 @@ func ReadVarint32(r io.Reader) (int32, error) {
 // returns the integer value, and the error (if any).
 func ReadVarint64(r io.Reader) (int64, error) {
 	return readVarint(r, 64)
-}
-
-// ReadVarUint64 reads a LEB128 encoded unsigned 64-bit integer from r, and
-// returns the integer value, and the error (if any).
-func ReadVarUint64(r io.Reader) (uint64, error) {
-	return readVarUint(r, 64)
 }

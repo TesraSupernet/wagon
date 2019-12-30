@@ -88,7 +88,7 @@ func (s *RawSection) GetRawSection() *RawSection {
 type InvalidSectionIDError SectionID
 
 func (e InvalidSectionIDError) Error() string {
-	return fmt.Sprintf("wasm: invalid section ID %d", e)
+	return fmt.Sprintf("wasm: invalid section ID %d", int(e))
 }
 
 type InvalidCodeIndexError int
@@ -654,11 +654,6 @@ func (s *SectionExports) WritePayload(w io.Writer) error {
 		entries = append(entries, e)
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		// If the Index # is the same, fall back to string comparing the field name.  This should ensure a
-		// deterministic sort order for the exports occurs, when run on the same .wasm file multiple times
-		if entries[i].Index == entries[j].Index {
-			return entries[i].FieldStr < entries[j].FieldStr
-		}
 		return entries[i].Index < entries[j].Index
 	})
 	for _, e := range entries {

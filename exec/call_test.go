@@ -6,16 +6,20 @@ package exec
 
 import (
 	"bytes"
+	"encoding/hex"
+	"fmt"
+	"math"
 	"reflect"
 	"testing"
 
 	"github.com/go-interpreter/wagon/wasm"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestHostCall(t *testing.T) {
-	const secretValue int64 = 0xdeadbeef
+	const secretValue = 0xdeadbeef
 
-	var secretVariable int64
+	var secretVariable int
 
 	// a host function that can be called by WASM code.
 	testHostFunction := func(proc *Process) {
@@ -23,7 +27,7 @@ func TestHostCall(t *testing.T) {
 	}
 
 	m := wasm.NewModule()
-	m.Start = &wasm.SectionStartFunction{Index: 0}
+	m.Start = nil
 
 	// A function signature. Both the host and WASM function
 	// have the same signature.
@@ -74,11 +78,17 @@ func TestHostCall(t *testing.T) {
 
 	// Once called, NewVM will execute the module's main
 	// function.
-	vm, err := NewVM(m)
+	vm, err := NewVM(m, math.MaxUint64)
 	if err != nil {
+		fmt.Printf("error is %s\n", err.Error())
 		t.Fatalf("Error creating VM: %v", vm)
 	}
+	GasLimit := uint64(1000000)
+	ExecStep := uint64(math.MaxUint64)
+	vm.AvaliableGas = &Gas{GasPrice: 500, GasLimit: &GasLimit, GasFactor: 5, ExecStep: &ExecStep}
+	vm.CallStackDepth = 1
 
+	vm.ExecCode(0)
 	if len(vm.funcs) < 1 {
 		t.Fatalf("Need at least a start function!")
 	}
@@ -178,10 +188,15 @@ func TestHostSymbolCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not read module: %v", err)
 	}
-	vm, err := NewVM(m)
+	vm, err := NewVM(m, math.MaxUint64)
 	if err != nil {
 		t.Fatalf("Could not instantiate vm: %v", err)
 	}
+	GasLimit := uint64(1000000)
+	ExecStep := uint64(math.MaxUint64)
+	vm.AvaliableGas = &Gas{GasPrice: 500, GasLimit: &GasLimit, GasFactor: 5, ExecStep: &ExecStep}
+	vm.CallStackDepth = 1
+
 	rtrns, err := vm.ExecCode(1)
 	if err != nil {
 		t.Fatalf("Error executing the default function: %v", err)
@@ -205,10 +220,15 @@ func TestGoFunctionCallChecksForFirstArgument(t *testing.T) {
 			}
 		}
 	}()
-	vm, err := NewVM(m)
+	vm, err := NewVM(m, math.MaxUint64)
 	if err != nil {
 		t.Fatalf("Could not instantiate vm: %v", err)
 	}
+	GasLimit := uint64(1000000)
+	ExecStep := uint64(math.MaxUint64)
+	vm.AvaliableGas = &Gas{GasPrice: 500, GasLimit: &GasLimit, GasFactor: 5, ExecStep: &ExecStep}
+	vm.CallStackDepth = 10000
+
 	_, err = vm.ExecCode(1)
 	if err != nil {
 		t.Fatalf("Error executing the default function: %v", err)
@@ -225,10 +245,15 @@ func TestHostTerminate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not read module: %v", err)
 	}
-	vm, err := NewVM(m)
+	vm, err := NewVM(m, math.MaxUint64)
 	if err != nil {
 		t.Fatalf("Could not instantiate vm: %v", err)
 	}
+	GasLimit := uint64(1000000)
+	ExecStep := uint64(math.MaxUint64)
+	vm.AvaliableGas = &Gas{GasPrice: 500, GasLimit: &GasLimit, GasFactor: 5, ExecStep: &ExecStep}
+	vm.CallStackDepth = 1
+
 	_, err = vm.ExecCode(1)
 	if err != nil {
 		t.Fatalf("Error executing the default function: %v", err)
@@ -236,4 +261,44 @@ func TestHostTerminate(t *testing.T) {
 	if vm.abort == false || vm.ctx.pc > 0xa {
 		t.Fatalf("Terminate did not abort execution: abort=%v, pc=%#x", vm.abort, vm.ctx.pc)
 	}
+}
+
+//
+func TestInfiniteRecursion(t *testing.T) {
+	/*
+		(module
+		  (type $t0 (func (param i32) (result i32)))
+		  (func $invoke (export "invoke") (type $t0) (param $p0 i32) (result i32)
+		    get_local $p0
+		    call $invoke))
+	*/
+	byteCode, err := hex.DecodeString("0061736d0100000001060160017f017f03020100070a0106696e766f6b6500000a08010600200010000b")
+	if err != nil {
+		panic(err)
+	}
+	m, err := wasm.ReadModule(bytes.NewReader(byteCode), func(name string) (*wasm.Module, error) {
+		return nil, fmt.Errorf("module %q unknown", name)
+	})
+	if err != nil {
+		panic(err)
+	}
+	// this code follows Tesra/smartcontract/wasmvm/wasm_service.go:Invoke(), with
+	// some error checking removed for brevity.
+	compiled, err := CompileModule(m)
+	if err != nil {
+		panic(err)
+	}
+	vm, err := NewVMWithCompiled(compiled, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("Could not instantiate vm: %v", err)
+	}
+	vm.RecoverPanic = true
+	GasLimit := uint64(100000000)
+	ExecStep := uint64(math.MaxUint64)
+	vm.AvaliableGas = &Gas{GasLimit: &GasLimit, GasPrice: 100, GasFactor: 5, ExecStep: &ExecStep}
+	vm.CallStackDepth = 100000
+	entry, _ := compiled.RawModule.Export.Entries["invoke"]
+	index := int64(entry.Index)
+	_, err = vm.ExecCode(index, 0)
+	assert.Equal(t, err, ErrCallStackDepthExceed)
 }

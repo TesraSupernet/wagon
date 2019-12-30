@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"reflect"
 
 	"github.com/go-interpreter/wagon/exec"
@@ -82,11 +83,14 @@ func ExampleVM_add() {
 		log.Fatalf("could not read module: %v", err)
 	}
 
-	vm, err := exec.NewVM(m)
+	vm, err := exec.NewVM(m, math.MaxUint64)
 	if err != nil {
 		log.Fatalf("could not create wagon vm: %v", err)
 	}
-
+	GasLimit := uint64(math.MaxUint64)
+	ExecStep := uint64(math.MaxUint64)
+	vm.AvaliableGas = &exec.Gas{GasPrice: 500, GasLimit: &GasLimit, GasFactor: 5, ExecStep: &ExecStep}
+	vm.CallStackDepth = 1000
 	const fct1 = 2 // index of function fct1
 	out, err := vm.ExecCode(fct1)
 	if err != nil {
