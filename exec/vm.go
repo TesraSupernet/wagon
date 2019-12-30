@@ -47,9 +47,16 @@ type context struct {
 	stack   []uint64
 	locals  []uint64
 	code    []byte
-	asm     []asmBlock
 	pc      int64
 	curFunc int64
+}
+
+type Gas struct {
+	GasPrice        uint64
+	GasLimit        *uint64
+	LocalGasCounter uint64
+	GasFactor       uint64
+	ExecStep        *uint64
 }
 
 // VM is the execution context for executing WebAssembly bytecode.
@@ -72,51 +79,45 @@ type VM struct {
 
 	abort bool // Flag for host functions to terminate execution
 
-	nativeBackend *nativeCompiler
+	//add for tesranode gas limit
+	AvaliableGas *Gas
+
+	HostData interface{}
+
+	//memory limitation
+	MemoryLimitation uint64
+	//call stack depth
+	CallStackDepth uint32
 }
 
 // As per the WebAssembly spec: https://github.com/WebAssembly/design/blob/27ac254c854994103c24834a994be16f74f54186/Semantics.md#linear-memory
-const wasmPageSize = 65536 // (64 KB)
+const wasmPageSize = wasm.WasmPageSize
 
 var endianess = binary.LittleEndian
 
-type config struct {
-	EnableAOT bool
+type CompiledModule struct {
+	RawModule *wasm.Module
+	globals   []uint64
+	memory    []byte
+	funcs     []function
 }
 
-// VMOption describes a customization that can be applied to the VM.
-type VMOption func(c *config)
-
-// EnableAOT enables ahead-of-time compilation of supported opcodes
-// into runs of native instructions, if wagon supports native compilation
-// for the current architecture.
-func EnableAOT(v bool) VMOption {
-	return func(c *config) {
-		c.EnableAOT = v
-	}
-}
-
-// NewVM creates a new VM from a given module and options. If the module defines
-// a start function, it will be executed.
-func NewVM(module *wasm.Module, opts ...VMOption) (*VM, error) {
-	var vm VM
-	var options config
-	for _, opt := range opts {
-		opt(&options)
-	}
+func CompileModule(module *wasm.Module) (*CompiledModule, error) {
+	var compiled CompiledModule
 
 	if module.Memory != nil && len(module.Memory.Entries) != 0 {
 		if len(module.Memory.Entries) > 1 {
 			return nil, ErrMultipleLinearMemories
 		}
-		vm.memory = make([]byte, uint(module.Memory.Entries[0].Limits.Initial)*wasmPageSize)
-		copy(vm.memory, module.LinearMemoryIndexSpace[0])
+
+		memsize := uint(module.Memory.Entries[0].Limits.Initial) * wasmPageSize
+		compiled.memory = make([]byte, memsize)
+		copy(compiled.memory, module.LinearMemoryIndexSpace[0])
 	}
 
-	vm.funcs = make([]function, len(module.FunctionIndexSpace))
-	vm.globals = make([]uint64, len(module.GlobalIndexSpace))
-	vm.newFuncTable()
-	vm.module = module
+	compiled.funcs = make([]function, len(module.FunctionIndexSpace))
+	compiled.globals = make([]uint64, len(module.GlobalIndexSpace))
+	compiled.RawModule = module
 
 	nNatives := 0
 	for i, fn := range module.FunctionIndexSpace {
@@ -127,7 +128,7 @@ func NewVM(module *wasm.Module, opts ...VMOption) (*VM, error) {
 		// section of:
 		// https://webassembly.github.io/spec/core/exec/modules.html#allocation
 		if fn.IsHost() {
-			vm.funcs[i] = goFunction{
+			compiled.funcs[i] = goFunction{
 				typ: fn.Host.Type(),
 				val: fn.Host,
 			}
@@ -145,11 +146,10 @@ func NewVM(module *wasm.Module, opts ...VMOption) (*VM, error) {
 		for _, entry := range fn.Body.Locals {
 			totalLocalVars += int(entry.Count)
 		}
-		code, meta := compile.Compile(disassembly.Code)
-		vm.funcs[i] = compiledFunction{
-			codeMeta:       meta,
+		code, table := compile.Compile(disassembly.Code)
+		compiled.funcs[i] = compiledFunction{
 			code:           code,
-			branchTables:   meta.BranchTables,
+			branchTables:   table,
 			maxDepth:       disassembly.MaxDepth,
 			totalLocalVars: totalLocalVars,
 			args:           len(fn.Sig.ParamTypes),
@@ -157,49 +157,63 @@ func NewVM(module *wasm.Module, opts ...VMOption) (*VM, error) {
 		}
 	}
 
-	if err := vm.resetGlobals(); err != nil {
-		return nil, err
-	}
-
-	if module.Start != nil {
-		_, err := vm.ExecCode(int64(module.Start.Index))
+	for i, global := range module.GlobalIndexSpace {
+		val, err := module.ExecInitExpr(global.Init)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	if options.EnableAOT {
-		supportedBackend, backend := nativeBackend()
-		if supportedBackend {
-			vm.nativeBackend = backend
-			if err := vm.tryNativeCompile(); err != nil {
-				return nil, err
-			}
+		switch v := val.(type) {
+		case int32:
+			compiled.globals[i] = uint64(v)
+		case int64:
+			compiled.globals[i] = uint64(v)
+			//case float32:
+			//	compiled.globals[i] = uint64(math.Float32bits(v))
+			//case float64:
+			//	compiled.globals[i] = uint64(math.Float64bits(v))
 		}
 	}
+
+	if module.Start != nil {
+		//_, err := compiled.ExecCode(int64(module.Start.Index))
+		//if err != nil {
+		//	return nil, err
+		//}
+		return nil, errors.New("start entry is not supported in smart contract")
+	}
+
+	return &compiled, nil
+}
+
+func NewVMWithCompiled(module *CompiledModule, memLimit uint64) (*VM, error) {
+	var vm VM
+
+	memsize := len(module.memory)
+	if uint64(memsize) > memLimit {
+		return nil, fmt.Errorf("memory is exceed the limitation of %d", memLimit)
+	}
+	vm.MemoryLimitation = memLimit
+	vm.memory = make([]byte, memsize)
+	copy(vm.memory, module.memory)
+
+	vm.funcs = module.funcs
+	vm.globals = make([]uint64, len(module.RawModule.GlobalIndexSpace))
+	copy(vm.globals, module.globals)
+	vm.newFuncTable()
+	vm.module = module.RawModule
 
 	return &vm, nil
 }
 
-func (vm *VM) resetGlobals() error {
-	for i, global := range vm.module.GlobalIndexSpace {
-		val, err := vm.module.ExecInitExpr(global.Init)
-		if err != nil {
-			return err
-		}
-		switch v := val.(type) {
-		case int32:
-			vm.globals[i] = uint64(v)
-		case int64:
-			vm.globals[i] = uint64(v)
-		case float32:
-			vm.globals[i] = uint64(math.Float32bits(v))
-		case float64:
-			vm.globals[i] = uint64(math.Float64bits(v))
-		}
+// NewVM creates a new VM from a given module. If the module defines a
+// start function, it will be executed.
+func NewVM(module *wasm.Module, memLimit uint64) (*VM, error) {
+	compiled, err := CompileModule(module)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil
+	return NewVMWithCompiled(compiled, memLimit)
 }
 
 // Memory returns the linear memory space for the VM.
@@ -347,14 +361,16 @@ func (vm *VM) ExecCode(fnIndex int64, args ...uint64) (rtrn interface{}, err err
 	vm.ctx.locals = make([]uint64, compiled.totalLocalVars)
 	vm.ctx.pc = 0
 	vm.ctx.code = compiled.code
-	vm.ctx.asm = compiled.asm
 	vm.ctx.curFunc = fnIndex
 
 	for i, arg := range args {
 		vm.ctx.locals[i] = arg
 	}
 
-	res := vm.execCode(compiled)
+	res, err := vm.execCode(compiled)
+	if err != nil {
+		return nil, fmt.Errorf("exec:%v", err)
+	}
 	if compiled.returns {
 		rtrnType := vm.module.GetFunction(int(fnIndex)).Sig.ReturnTypes[0]
 		switch rtrnType {
@@ -362,10 +378,10 @@ func (vm *VM) ExecCode(fnIndex int64, args ...uint64) (rtrn interface{}, err err
 			rtrn = uint32(res)
 		case wasm.ValueTypeI64:
 			rtrn = uint64(res)
-		case wasm.ValueTypeF32:
-			rtrn = math.Float32frombits(uint32(res))
-		case wasm.ValueTypeF64:
-			rtrn = math.Float64frombits(res)
+		//case wasm.ValueTypeF32:
+		//	rtrn = math.Float32frombits(uint32(res))
+		//case wasm.ValueTypeF64:
+		//	rtrn = math.Float64frombits(res)
 		default:
 			return nil, InvalidReturnTypeError(rtrnType)
 		}
@@ -374,9 +390,17 @@ func (vm *VM) ExecCode(fnIndex int64, args ...uint64) (rtrn interface{}, err err
 	return rtrn, nil
 }
 
-func (vm *VM) execCode(compiled compiledFunction) uint64 {
+func (vm *VM) execCode(compiled compiledFunction) (uint64, error) {
 outer:
 	for int(vm.ctx.pc) < len(vm.ctx.code) && !vm.abort {
+		if !vm.checkGas(1) {
+			return 0, fmt.Errorf("exec:reach the gas limit")
+		}
+
+		if !vm.CheckExecStep() {
+			return 0, fmt.Errorf("exec:reach the maxStepCount")
+		}
+
 		op := vm.ctx.code[vm.ctx.pc]
 		vm.ctx.pc++
 		switch op {
@@ -443,37 +467,49 @@ outer:
 			place := vm.fetchInt64()
 			vm.ctx.stack = vm.ctx.stack[:len(vm.ctx.stack)-int(place)]
 			vm.pushUint64(top)
-
-		case ops.WagonNativeExec:
-			i := vm.fetchUint32()
-			vm.nativeCodeInvocation(i)
 		default:
 			vm.funcTable[op]()
 		}
 	}
 
 	if compiled.returns && !vm.abort {
-		return vm.ctx.stack[len(vm.ctx.stack)-1]
+		return vm.ctx.stack[len(vm.ctx.stack)-1], nil
 	}
-	return 0
+	return 0, nil
 }
 
-// Restart readies the VM for another run.
-func (vm *VM) Restart() {
-	vm.resetGlobals()
-	vm.ctx.locals = make([]uint64, 0)
-	vm.abort = false
+//check gas
+func (vm *VM) checkGas(gaslimit uint64) bool {
+	vm.AvaliableGas.LocalGasCounter += gaslimit
+	normalizationGasLimit := vm.AvaliableGas.LocalGasCounter / vm.AvaliableGas.GasFactor
+
+	vm.AvaliableGas.LocalGasCounter = vm.AvaliableGas.LocalGasCounter % vm.AvaliableGas.GasFactor
+	if normalizationGasLimit == 0 {
+		return true
+	}
+
+	if *vm.AvaliableGas.GasLimit >= normalizationGasLimit {
+		*vm.AvaliableGas.GasLimit -= normalizationGasLimit
+		return true
+	}
+	return false
 }
 
-// Close frees any resources managed by the VM.
-func (vm *VM) Close() error {
-	vm.abort = true // prevents further use.
-	if vm.nativeBackend != nil {
-		if err := vm.nativeBackend.Close(); err != nil {
-			return err
-		}
+func (vm *VM) CheckExecStep() bool {
+	if *vm.AvaliableGas.ExecStep < 1 {
+		return false
 	}
-	return nil
+
+	*vm.AvaliableGas.ExecStep -= 1
+	return true
+}
+
+func (vm *VM) checkCallStackDepth() {
+	if vm.CallStackDepth <= 0 {
+		panic(ErrCallStackDepthExceed)
+	}
+	vm.CallStackDepth--
+
 }
 
 // Process is a proxy passed to host functions in order to access
@@ -539,4 +575,8 @@ func (proc *Process) MemSize() int {
 // Terminate stops the execution of the current module.
 func (proc *Process) Terminate() {
 	proc.vm.abort = true
+}
+
+func (proc *Process) HostData() interface{} {
+	return proc.vm.HostData
 }

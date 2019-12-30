@@ -80,19 +80,6 @@ var (
 	OpDiscardPreserveTop byte = 0x05
 )
 
-const (
-	// instAndInt64Len represents the number of bytes consumed by a wire
-	// representation of an instruction and an int64.
-	instAndInt64Len = 9
-	// ifBranchLen represents the number of bytes needed to represent a
-	// conditional if branch.
-	// Byte 0     - represents the opcode.
-	// Byte 1-8   - represents the branch address.
-	// Byte 9     - 1 if the top of stack should be preserved, 0 otherwise.
-	// Byte 10-18 - number of stack positions to discard.
-	ifBranchLen = 18
-)
-
 // Target is the "target" of a br_table instruction.
 // Unlike other control instructions, br_table does jumps and discarding all
 // by itself.
@@ -144,52 +131,31 @@ type block struct {
 	branchTables []*BranchTable   // All branch tables that were defined in this block.
 }
 
-// BytecodeMetadata encapsulates metadata about a bytecode stream.
-type BytecodeMetadata struct {
-	BranchTables []*BranchTable
-	Instructions []InstructionMetadata
-
-	// Inbound jumps - used by the AOT/JIT scanner to
-	// avoid generating native code which has an inbound
-	// jump target somewhere deep inside.
-	InboundTargets map[int64]struct{}
-}
-
 // Compile rewrites WebAssembly bytecode from its disassembly.
 // TODO(vibhavp): Add options for optimizing code. Operators like i32.reinterpret/f32
 // are no-ops, and can be safely removed.
-func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
+func Compile(disassembly []disasm.Instr) ([]byte, []*BranchTable) {
 	buffer := new(bytes.Buffer)
-	metadata := make([]InstructionMetadata, 0, len(disassembly))
 	branchTables := []*BranchTable{}
-	inboundTargets := make(map[int64]struct{})
 
 	curBlockDepth := -1
 	blocks := make(map[int]*block) // maps nesting depths (labels) to blocks
 
-	// Helper closure - shorthand to emit instruction metadata.
-	emitMetadata := func(op byte, index, size int) {
-		metadata = append(metadata, InstructionMetadata{
-			Op:    op,
-			Start: index,
-			Size:  size,
-		})
-	}
-
 	blocks[-1] = &block{}
+
 	for _, instr := range disassembly {
 		if instr.Unreachable {
 			continue
 		}
 		switch instr.Op.Code {
-		case ops.I32Load, ops.I64Load, ops.F32Load, ops.F64Load, ops.I32Load8s, ops.I32Load8u, ops.I32Load16s, ops.I32Load16u, ops.I64Load8s, ops.I64Load8u, ops.I64Load16s, ops.I64Load16u, ops.I64Load32s, ops.I64Load32u, ops.I32Store, ops.I64Store, ops.F32Store, ops.F64Store, ops.I32Store8, ops.I32Store16, ops.I64Store8, ops.I64Store16, ops.I64Store32:
+		//case ops.I32Load, ops.I64Load, ops.F32Load, ops.F64Load, ops.I32Load8s, ops.I32Load8u, ops.I32Load16s, ops.I32Load16u, ops.I64Load8s, ops.I64Load8u, ops.I64Load16s, ops.I64Load16u, ops.I64Load32s, ops.I64Load32u, ops.I32Store, ops.I64Store, ops.F32Store, ops.F64Store, ops.I32Store8, ops.I32Store16, ops.I64Store8, ops.I64Store16, ops.I64Store32:
+		case ops.I32Load, ops.I64Load, ops.I32Load8s, ops.I32Load8u, ops.I32Load16s, ops.I32Load16u, ops.I64Load8s, ops.I64Load8u, ops.I64Load16s, ops.I64Load16u, ops.I64Load32s, ops.I64Load32u, ops.I32Store, ops.I64Store, ops.I32Store8, ops.I32Store16, ops.I64Store8, ops.I64Store16, ops.I64Store32:
 			// memory_immediate has two fields, the alignment and the offset.
 			// The former is simply an optimization hint and can be safely
 			// discarded.
 			instr.Immediates = []interface{}{instr.Immediates[1].(uint32)}
 		case ops.If:
 			curBlockDepth++
-			emitMetadata(OpJmpZ, buffer.Len(), instAndInt64Len)
 			buffer.WriteByte(OpJmpZ)
 			blocks[curBlockDepth] = &block{
 				ifBlock:        true,
@@ -206,16 +172,27 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 				offset:    int64(buffer.Len()),
 				ifBlock:   false,
 				loopBlock: true,
+				discard:   *instr.NewStack,
 			}
 			continue
 		case ops.Block:
 			curBlockDepth++
 			blocks[curBlockDepth] = &block{
 				ifBlock: false,
+				discard: *instr.NewStack,
 			}
 			continue
 		case ops.Else:
-			emitMetadata(OpJmp, buffer.Len(), instAndInt64Len)
+			ifInstr := disassembly[instr.Block.ElseIfIndex] // the corresponding `if` instruction for this else
+			if ifInstr.NewStack != nil && ifInstr.NewStack.StackTopDiff != 0 {
+				// add code for jumping out of a taken if branch
+				if ifInstr.NewStack.PreserveTop {
+					buffer.WriteByte(OpDiscardPreserveTop)
+				} else {
+					buffer.WriteByte(OpDiscard)
+				}
+				binary.Write(buffer, binary.LittleEndian, ifInstr.NewStack.StackTopDiff)
+			}
 			buffer.WriteByte(OpJmp)
 			ifBlockEndOffset := int64(buffer.Len())
 			binary.Write(buffer, binary.LittleEndian, int64(0))
@@ -224,7 +201,7 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 			ifBlock := blocks[curBlockDepth]
 			code := buffer.Bytes()
 
-			buffer = patchOffset(code, ifBlock.elseAddrOffset, curOffset, inboundTargets)
+			buffer = patchOffset(code, ifBlock.elseAddrOffset, curOffset)
 			// this is no longer an if block
 			ifBlock.ifBlock = false
 			ifBlock.patchOffsets = append(ifBlock.patchOffsets, ifBlockEndOffset)
@@ -233,21 +210,35 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 			depth := curBlockDepth
 			block := blocks[depth]
 
+			if instr.NewStack.StackTopDiff != 0 {
+				// when exiting a block, discard elements to
+				// restore stack height.
+				if instr.NewStack.PreserveTop {
+					// this is true when the block has a
+					// signature, and therefore pushes
+					// a value on to the stack
+					buffer.WriteByte(OpDiscardPreserveTop)
+				} else {
+					buffer.WriteByte(OpDiscard)
+				}
+				binary.Write(buffer, binary.LittleEndian, instr.NewStack.StackTopDiff)
+			}
+
 			if !block.loopBlock { // is a normal block
 				block.offset = int64(buffer.Len())
 				if block.ifBlock {
 					code := buffer.Bytes()
-					buffer = patchOffset(code, block.elseAddrOffset, int64(block.offset), inboundTargets)
+					buffer = patchOffset(code, block.elseAddrOffset, int64(block.offset))
 				}
 			}
 
 			for _, offset := range block.patchOffsets {
 				code := buffer.Bytes()
-				buffer = patchOffset(code, offset, block.offset, inboundTargets)
+				buffer = patchOffset(code, offset, block.offset)
 			}
 
 			for _, table := range block.branchTables {
-				table.patchTable(table.blocksLen-depth-1, int64(block.offset), inboundTargets)
+				table.patchTable(table.blocksLen-depth-1, int64(block.offset))
 			}
 
 			delete(blocks, curBlockDepth)
@@ -255,15 +246,13 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 			continue
 		case ops.Br:
 			if instr.NewStack != nil && instr.NewStack.StackTopDiff != 0 {
-				op := OpDiscard
 				if instr.NewStack.PreserveTop {
-					op = OpDiscardPreserveTop
+					buffer.WriteByte(OpDiscardPreserveTop)
+				} else {
+					buffer.WriteByte(OpDiscard)
 				}
-				emitMetadata(op, buffer.Len(), instAndInt64Len)
-				buffer.WriteByte(op)
 				binary.Write(buffer, binary.LittleEndian, instr.NewStack.StackTopDiff)
 			}
-			emitMetadata(OpJmp, buffer.Len(), instAndInt64Len)
 			buffer.WriteByte(OpJmp)
 			label := int(instr.Immediates[0].(uint32))
 			block := blocks[curBlockDepth-int(label)]
@@ -272,7 +261,6 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 			binary.Write(buffer, binary.LittleEndian, int64(0))
 			continue
 		case ops.BrIf:
-			emitMetadata(OpJmpNz, buffer.Len(), ifBranchLen)
 			buffer.WriteByte(OpJmpNz)
 			label := int(instr.Immediates[0].(uint32))
 			block := blocks[curBlockDepth-int(label)]
@@ -320,12 +308,10 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 				block.branchTables = append(block.branchTables, branchTable)
 			}
 
-			emitMetadata(ops.BrTable, buffer.Len(), instAndInt64Len)
 			buffer.WriteByte(ops.BrTable)
 			binary.Write(buffer, binary.LittleEndian, int64(len(branchTables)-1))
 		}
 
-		startIndex := buffer.Len()
 		buffer.WriteByte(instr.Op.Code)
 		for _, imm := range instr.Immediates {
 			err := binary.Write(buffer, binary.LittleEndian, imm)
@@ -333,7 +319,6 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 				panic(err)
 			}
 		}
-		emitMetadata(instr.Op.Code, startIndex, buffer.Len()-startIndex)
 	}
 
 	// writing nop as the last instructions allows us to branch out of the
@@ -344,22 +329,17 @@ func Compile(disassembly []disasm.Instr) ([]byte, *BytecodeMetadata) {
 	// patch all references to the "root" block of the function body
 	for _, offset := range blocks[-1].patchOffsets {
 		code := buffer.Bytes()
-		buffer = patchOffset(code, offset, int64(addr), inboundTargets)
+		buffer = patchOffset(code, offset, int64(addr))
 	}
 
 	for _, table := range branchTables {
 		table.patchedAddrs = nil
 	}
-	return buffer.Bytes(), &BytecodeMetadata{
-		BranchTables:   branchTables,
-		Instructions:   metadata,
-		InboundTargets: inboundTargets,
-	}
+	return buffer.Bytes(), branchTables
 }
 
 // replace the address starting at start with addr
-func patchOffset(code []byte, start int64, addr int64, inboundTargets map[int64]struct{}) *bytes.Buffer {
-	inboundTargets[addr] = struct{}{}
+func patchOffset(code []byte, start int64, addr int64) *bytes.Buffer {
 	var shift uint
 	for i := int64(0); i < 8; i++ {
 		code[start+i] = byte(addr >> shift)
@@ -371,8 +351,7 @@ func patchOffset(code []byte, start int64, addr int64, inboundTargets map[int64]
 	return buf
 }
 
-func (table *BranchTable) patchTable(block int, addr int64, inboundTargets map[int64]struct{}) {
-	inboundTargets[addr] = struct{}{}
+func (table *BranchTable) patchTable(block int, addr int64) {
 	if block < 0 {
 		panic("Invalid block value")
 	}

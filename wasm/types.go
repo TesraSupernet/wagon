@@ -28,15 +28,15 @@ type ValueType uint8
 const (
 	ValueTypeI32 ValueType = 0x7f
 	ValueTypeI64 ValueType = 0x7e
-	ValueTypeF32 ValueType = 0x7d
-	ValueTypeF64 ValueType = 0x7c
+	//ValueTypeF32 ValueType = 0x7d
+	//ValueTypeF64 ValueType = 0x7c
 )
 
 var valueTypeStrMap = map[ValueType]string{
 	ValueTypeI32: "i32",
 	ValueTypeI64: "i64",
-	ValueTypeF32: "f32",
-	ValueTypeF64: "f64",
+	//ValueTypeF32: "f32",
+	//ValueTypeF64: "f64",
 }
 
 func (t ValueType) String() string {

@@ -25,7 +25,6 @@ type Function struct {
 	Sig  *FunctionSig
 	Body *FunctionBody
 	Host reflect.Value
-	Name string
 }
 
 // IsHost indicates whether this function is a host function as defined in:
@@ -153,6 +152,11 @@ func ReadModule(r io.Reader, resolvePath ResolveFunc) (*Module, error) {
 		}
 	}
 
+	err = WasmCalibration(m)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, fn := range []func() error{
 		m.populateGlobals,
 		m.populateFunctions,
@@ -162,6 +166,12 @@ func ReadModule(r io.Reader, resolvePath ResolveFunc) (*Module, error) {
 		if err := fn(); err != nil {
 			return nil, err
 		}
+
+	}
+
+	//for smart contract , start entry is not supported
+	if m.Start != nil {
+		return nil, errors.New("start entry is not supported in smart contract")
 	}
 
 	logger.Printf("There are %d entries in the function index space.", len(m.FunctionIndexSpace))
